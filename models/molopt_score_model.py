@@ -670,6 +670,7 @@ class ScorePosNet3D(nn.Module):
     @torch.no_grad()
     def sample_diffusion(self, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
+                         ligand_pos =  None, ligand_v = None, ligand_mask = None, # for inpainting
                          num_steps=None, center_pos_mode=None, pos_only=False):
         """ Denoise the init_ligand_pos and init_ligand_v.
         Assuming batch_size 2 and 500, 300 atoms for each protein, 40, 30 atoms for each ligand
@@ -692,6 +693,17 @@ class ScorePosNet3D(nn.Module):
             num_steps = self.num_timesteps
         num_graphs = batch_protein.max().item() + 1
 
+        # for inpainting start
+        if ligand_pos is not None:
+            _, ligand_pos, _ = center_pos(
+                protein_pos,
+                ligand_pos,
+                batch_protein,
+                batch_ligand,
+                mode=center_pos_mode,
+            )
+        # for inpainting end
+            
         ## Shifts the origin to the centre of mass of protein
         ## new protein positions, new ligand position and the difference from original position is in the offset
         protein_pos, init_ligand_pos, offset = center_pos(
@@ -699,6 +711,11 @@ class ScorePosNet3D(nn.Module):
 
         pos_traj, v_traj = [], []
         v0_pred_traj, vt_pred_traj, pos0_traj = [], [], []
+
+        # for inpainting start
+        ligand_pos_gt, ligand_v_gt = ligand_pos, ligand_v
+        # for inpainting end
+
         ligand_pos, ligand_v = init_ligand_pos, init_ligand_v
         ## time sequence - going from 1000 to 1000 - num_steps
         time_seq = list(reversed(range(self.num_timesteps - num_steps, self.num_timesteps)))
@@ -743,6 +760,30 @@ class ScorePosNet3D(nn.Module):
                 vt_pred_traj.append(log_model_prob.clone().cpu())
                 ligand_v = ligand_v_next
 
+            # for inpainting start
+            if ligand_mask is not None:
+                assert ligand_pos_gt is not None and ligand_v_gt is not None
+                assert ligand_pos_gt.shape == ligand_pos.shape, f"Shape mismatch {ligand_pos_gt.shape} != {ligand_pos.shape}"  # ref mode for inpainting
+                ligand_pos_mask = ligand_mask.unsqueeze(-1).expand_as(ligand_pos)
+                # apply noise to get ligand_pos_t, ligand_v_t
+                a = self.alphas_cumprod.index_select(0, t)  # (num_graphs, )
+                # 2. perturb pos and v
+                a_pos = a[batch_ligand].unsqueeze(-1)  # (num_ligand_atoms, 1)
+                pos_noise = torch.zeros_like(ligand_pos)
+                pos_noise.normal_()
+                # Xt = a.sqrt() * X0 + (1-a).sqrt() * eps
+                ligand_pos_perturbed = a_pos.sqrt() * ligand_pos_gt + (1.0 - a_pos).sqrt() * pos_noise  # pos_noise * std
+                # Vt = a * V0 + (1-a) / K
+                log_ligand_v0 = index_to_log_onehot(ligand_v_gt, self.num_classes)
+                ligand_v_perturbed, log_ligand_vt = self.q_v_sample(log_ligand_v0, t, batch_ligand)
+                if i == time_seq[-1]:
+                    ligand_pos_perturbed = ligand_pos_gt
+                    ligand_v_perturbed = ligand_v_gt
+                ligand_pos = torch.where(ligand_pos_mask, ligand_pos_perturbed, ligand_pos)
+                ligand_v_mask = ligand_mask.expand_as(ligand_v)
+                ligand_v = torch.where(ligand_v_mask, ligand_v_perturbed, ligand_v)
+            # for inpainting end
+                
             ori_ligand_pos0 = pos0_from_e + offset[batch_ligand]
             ori_ligand_pos = ligand_pos + offset[batch_ligand]
             pos_traj.append(ori_ligand_pos.clone().cpu())
