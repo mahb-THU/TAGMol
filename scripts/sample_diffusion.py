@@ -9,6 +9,7 @@ from torch_geometric.data import Batch
 from torch_geometric.transforms import Compose
 from torch_scatter import scatter_sum, scatter_mean
 from tqdm.auto import tqdm
+from rdkit import Chem
 
 import utils.misc as misc
 import utils.transforms as trans
@@ -16,6 +17,7 @@ from datasets import get_dataset
 from datasets.pl_data import FOLLOW_BATCH
 from models.molopt_score_model import ScorePosNet3D, log_sample_categorical
 from utils.evaluation import atom_num
+from utils import reconstruct, transforms
 
 
 def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
@@ -38,6 +40,7 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
     num_batch = int(np.ceil(num_samples / batch_size))
     current_i = 0
     for i in tqdm(range(num_batch)):
+        ligand_pos, ligand_mask, ligand_v = None, None, None
         n_data = batch_size if i < num_batch - 1 else num_samples - batch_size * (num_batch - 1)
         batch = Batch.from_data_list([data.clone() for _ in range(n_data)], follow_batch=FOLLOW_BATCH).to(device)
 
@@ -51,9 +54,42 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
             elif sample_num_atoms == 'range':
                 ligand_num_atoms = list(range(current_i + 1, current_i + n_data + 1))
                 batch_ligand = torch.repeat_interleave(torch.arange(n_data), torch.tensor(ligand_num_atoms)).to(device)
-            elif sample_num_atoms == 'ref':
+            elif sample_num_atoms == 'ref' or sample_num_atoms == 'inpainting_ref':
                 batch_ligand = batch.ligand_element_batch
-                ligand_num_atoms = scatter_sum(torch.ones_like(batch_ligand), batch_ligand, dim=0).tolist()
+                ligand_num_atoms = scatter_sum(torch.ones_like(batch_ligand), batch_ligand, dim=0).to(device)
+                if sample_num_atoms == 'inpainting_ref':
+                    assert hasattr(batch, 'ligand_pos') and hasattr(batch, 'ligand_atom_feature_full') and hasattr(batch, 'ligand_mask')
+                    ligand_mask = batch.ligand_mask
+                    ligand_pos = batch.ligand_pos
+                    ligand_v = batch.ligand_atom_feature_full
+            elif sample_num_atoms == 'inpainting_prior':
+                assert hasattr(batch, 'ligand_pos') and hasattr(batch, 'ligand_atom_feature_full') and hasattr(batch, 'ligand_mask')
+                ligand_num_atoms = []
+                ligand_mask, ligand_pos, ligand_v = [], [], []
+                while len(ligand_num_atoms) < len(batch):
+                    data_id = len(ligand_num_atoms)
+                    data = batch[data_id]
+                    pocket_size = atom_num.get_space_size(data.protein_pos.detach().cpu().numpy())
+                    atom_nums = atom_num.sample_atom_num(pocket_size).astype(int)
+                    if atom_nums < len(data.ligand_pos):
+                        continue
+                    ligand_num_atoms.append(atom_nums)
+                    # update ligand_pos and ligand_v, ligand_mask
+                    data.ligand_pos = torch.cat([data.ligand_pos, torch.zeros(atom_nums - len(data.ligand_pos), 3, device=data.ligand_pos.device)])
+                    data.ligand_atom_feature_full = torch.cat([data.ligand_atom_feature_full, torch.zeros(atom_nums - len(data.ligand_atom_feature_full), device=data.ligand_atom_feature_full.device)])
+                    data.ligand_mask = torch.cat([data.ligand_mask, torch.zeros(atom_nums - len(data.ligand_mask), dtype=torch.bool, device=data.ligand_mask.device)])
+                    batch[data_id] = data
+                    # print(f"sampled {atom_nums} atoms for ligand {data_id} in inpainting_prior mode")
+                    assert len(data.ligand_pos) == atom_nums and len(data.ligand_atom_feature_full) == atom_nums and len(data.ligand_mask) == atom_nums
+                    ligand_mask.append(data.ligand_mask)
+                    ligand_pos.append(data.ligand_pos)
+                    ligand_v.append(data.ligand_atom_feature_full)
+                # print(f"ligand_num_atoms: {sum(ligand_num_atoms)}")
+                batch_ligand = torch.repeat_interleave(torch.arange(len(batch)), torch.tensor(ligand_num_atoms)).to(device)
+                ligand_num_atoms = torch.tensor(ligand_num_atoms, dtype=torch.long, device=device)
+                ligand_mask = torch.cat(ligand_mask, dim=0).bool()
+                ligand_pos = torch.cat(ligand_pos, dim=0)
+                ligand_v = torch.cat(ligand_v, dim=0).long()
             else:
                 raise ValueError
 
@@ -79,12 +115,19 @@ def sample_diffusion_ligand(model, data, num_samples, batch_size=16, device='cud
                 batch_ligand=batch_ligand,
                 num_steps=num_steps,
                 pos_only=pos_only,
-                center_pos_mode=center_pos_mode
+                center_pos_mode=center_pos_mode,
+
+                ligand_pos=ligand_pos,   # for inpainting
+                ligand_v=ligand_v,       # for inpainting
+                ligand_mask=ligand_mask, # for inpainting
             )
             ligand_pos, ligand_v, ligand_pos_traj, ligand_v_traj = r['pos'], r['v'], r['pos_traj'], r['v_traj']
             ligand_v0_traj, ligand_vt_traj, ligand_pos0_traj = r['v0_traj'], r['vt_traj'], r['pos0_traj']
             # unbatch pos
-            ligand_cum_atoms = np.cumsum([0] + ligand_num_atoms)
+            ligand_cum_atoms = torch.cat([
+                torch.tensor([0], dtype=torch.long, device=device), 
+                ligand_num_atoms.cumsum(dim=0)
+            ]).cpu().numpy()
             ligand_pos_array = ligand_pos.cpu().numpy().astype(np.float64)
             all_pred_pos += [ligand_pos_array[ligand_cum_atoms[k]:ligand_cum_atoms[k + 1]] for k in
                              range(n_data)]  # num_samples * [num_atoms_i, 3]
@@ -132,10 +175,15 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--batch_size', type=int, default=100)
     parser.add_argument('--result_path', type=str, default='./outputs')
+    parser.add_argument('--change_scaffold',action='store_true')
     args = parser.parse_args()
 
     logger = misc.get_logger('sampling')
 
+    if os.path.exists(os.path.join(args.result_path, f'result_{args.data_id}.pt')):
+        print(f"Result {args.data_id} already exists!")
+        exit(0)
+        
     # Load config
     config = misc.load_config(args.config)
     logger.info(config)
@@ -149,13 +197,19 @@ if __name__ == '__main__':
     protein_featurizer = trans.FeaturizeProteinAtom()
     ligand_atom_mode = ckpt['config'].data.transform.ligand_atom_mode
     ligand_featurizer = trans.FeaturizeLigandAtom(ligand_atom_mode)
-    transform = Compose([
+    
+    transform_list = [
         protein_featurizer,
         ligand_featurizer,
         trans.FeaturizeLigandBond(),
-    ])
+    ]
+    if 'inpainting' in config.sample.sample_num_atoms:
+        transform_list.append(trans.AddScaffoldMask('/sharefs/share/sbdd_data/Mask_cd_test.pkl', change_scaffold=args.change_scaffold))
+    transform = Compose(transform_list)
 
     # Load dataset
+    ckpt['config'].data.path = '/sharefs/share/sbdd_data/crossdocked_v1.1_rmsd1.0_pocket10'
+    ckpt['config'].data.split = '/sharefs/share/sbdd_data/crossdocked_pocket10_pose_split.pt'
     dataset, subsets = get_dataset(
         config=ckpt['config'].data,
         transform=transform
@@ -173,23 +227,78 @@ if __name__ == '__main__':
     logger.info(f'Successfully load the model! {config.model.checkpoint}')
 
     data = test_set[args.data_id]
-    pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, pred_pos0_traj, time_list = sample_diffusion_ligand(
-        model, data, config.sample.num_samples,
-        batch_size=args.batch_size, device=args.device,
-        num_steps=config.sample.num_steps,
-        pos_only=config.sample.pos_only,
-        center_pos_mode=config.sample.center_pos_mode,
-        sample_num_atoms=config.sample.sample_num_atoms
-    )
+
+    # pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, pred_pos0_traj, time_list = sample_diffusion_ligand(
+    #     model, data, config.sample.num_samples,
+    #     batch_size=args.batch_size, device=args.device,
+    #     num_steps=config.sample.num_steps,
+    #     pos_only=config.sample.pos_only,
+    #     center_pos_mode=config.sample.center_pos_mode,
+    #     sample_num_atoms=config.sample.sample_num_atoms
+    # )
+    # result = {
+    #     'data': data,
+    #     'pred_ligand_pos': pred_pos,
+    #     'pred_ligand_v': pred_v,
+    #     'pred_ligand_pos_traj': pred_pos_traj,
+    #     'pred_ligand_v_traj': pred_v_traj,
+    #     'pred_ligand_pos0_traj':pred_pos0_traj,
+    #     'pred_ligand_v0_traj': pred_v0_traj,
+    #     'time': time_list
+    # }
+
+    valid_pred_pos = []
+    valid_pred_v = []
+    valid_pred_pos_traj = []
+    valid_pred_v_traj = []
+    valid_time_list = []
+
+    num_tries = 0
+    while len(valid_pred_pos_traj) < config.sample.num_samples and num_tries < 10:
+        num_tries += 1
+        pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, time_list = sample_diffusion_ligand(
+            model, data, (config.sample.num_samples - len(valid_pred_pos_traj)),
+            batch_size=args.batch_size, device=args.device,
+            num_steps=config.sample.num_steps,
+            pos_only=config.sample.pos_only,
+            center_pos_mode=config.sample.center_pos_mode,
+            sample_num_atoms=config.sample.sample_num_atoms
+        )
+
+        # Add a reconstruction step to check if it can be successfully reconstructed
+        for sample_idx, (pred_pos_, pred_v_) in enumerate(zip(pred_pos_traj, pred_v_traj)):
+            pred_pos_, pred_v_ = pred_pos_[-1], pred_v_[-1]
+
+            # stability check
+            pred_atom_type = transforms.get_atomic_number_from_index(pred_v_, mode="add_aromatic")
+
+            # reconstruction
+            try:
+                pred_aromatic = transforms.is_aromatic_from_index(pred_v_, mode="add_aromatic")
+                mol = reconstruct.reconstruct_from_generated(pred_pos_, pred_atom_type, pred_aromatic)
+            except Exception as e:
+                continue
+
+            # incomplete molecule
+            smiles = Chem.MolToSmiles(mol)
+            if '.' in smiles:
+                continue
+
+            valid_pred_pos.append(pred_pos[sample_idx])
+            valid_pred_v.append(pred_v[sample_idx])
+            valid_pred_pos_traj.append(pred_pos_traj[sample_idx])
+            valid_pred_v_traj.append(pred_v_traj[sample_idx])
+        
+        valid_time_list += time_list
+        logger.info(f"Sample {len(valid_pred_pos_traj)} done!")
+
     result = {
         'data': data,
-        'pred_ligand_pos': pred_pos,
-        'pred_ligand_v': pred_v,
-        'pred_ligand_pos_traj': pred_pos_traj,
-        'pred_ligand_v_traj': pred_v_traj,
-        'pred_ligand_pos0_traj':pred_pos0_traj,
-        'pred_ligand_v0_traj': pred_v0_traj,
-        'time': time_list
+        'pred_ligand_pos': valid_pred_pos,
+        'pred_ligand_v': valid_pred_v,
+        'pred_ligand_pos_traj': valid_pred_pos_traj,
+        'pred_ligand_v_traj': valid_pred_v_traj,
+        'time': valid_time_list
     }
     logger.info('Sample done!')
 
