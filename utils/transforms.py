@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import pickle
 
 from datasets.pl_data import ProteinLigandData
 from utils import data as utils_data
@@ -43,6 +44,7 @@ MAP_ATOM_TYPE_ONLY_TO_INDEX = {
     15: 5,
     16: 6,
     17: 7,
+    35: 8,
 }
 
 MAP_ATOM_TYPE_AROMATIC_TO_INDEX = {
@@ -61,16 +63,52 @@ MAP_ATOM_TYPE_AROMATIC_TO_INDEX = {
     (17, False): 12
 }
 
+MAP_ATOM_TYPE_AROMATIC_PDB_TO_INDEX = {
+    (1, False): 0,  # 998
+    (6, False): 1,  # 803564
+    (6, True): 2,   # 1371671
+    (7, False): 3,  # 198073
+    (7, True): 4,   # 209316
+    (8, False): 5,  # 264143
+    (8, True): 6,   # 8567
+    (9, False): 7,  # 72259 
+    (15, False): 8, # 2051
+    (16, False): 9, # 21263
+    (16, True): 10, # 11529
+    (17, False): 11, # 26781
+    (35, False): 12, # 3359
+}
+
+MAP_ATOM_TYPE_AROMATIC_PDB_ALL_TO_INDEX = {
+    (1, False): 0,  # 998
+    (6, False): 1,  # 803564
+    (6, True): 2,   # 1371671
+    (7, False): 3,  # 198073
+    (7, True): 4,   # 209316
+    (8, False): 5,  # 264143
+    (8, True): 6,   # 8567
+    (9, False): 7,  # 72259
+    (14, False): 8, # 92 -------
+    (15, False): 9, # 2051
+    (16, False): 10, # 21263
+    (16, True): 11, # 11529
+    (17, False): 12, # 26781
+    (35, False): 13, # 3359
+    (53, False): 14, # 852 -----
+}
+
 MAP_INDEX_TO_ATOM_TYPE_ONLY = {v: k for k, v in MAP_ATOM_TYPE_ONLY_TO_INDEX.items()}
 MAP_INDEX_TO_ATOM_TYPE_AROMATIC = {v: k for k, v in MAP_ATOM_TYPE_AROMATIC_TO_INDEX.items()}
 MAP_INDEX_TO_ATOM_TYPE_FULL = {v: k for k, v in MAP_ATOM_TYPE_FULL_TO_INDEX.items()}
-
+MAP_INDEX_TO_ATOM_TYPE_AROMATIC_PDB = {v: k for k, v in MAP_ATOM_TYPE_AROMATIC_PDB_TO_INDEX.items()}
 
 def get_atomic_number_from_index(index, mode):
     if mode == 'basic':
         atomic_number = [MAP_INDEX_TO_ATOM_TYPE_ONLY[i] for i in index.tolist()]
     elif mode == 'add_aromatic':
         atomic_number = [MAP_INDEX_TO_ATOM_TYPE_AROMATIC[i][0] for i in index.tolist()]
+    elif mode == 'add_aromatic_pdb':
+        atomic_number = [MAP_INDEX_TO_ATOM_TYPE_AROMATIC_PDB[i][0] for i in index.tolist()]
     elif mode == 'full':
         atomic_number = [MAP_INDEX_TO_ATOM_TYPE_FULL[i][0] for i in index.tolist()]
     else:
@@ -81,6 +119,8 @@ def get_atomic_number_from_index(index, mode):
 def is_aromatic_from_index(index, mode):
     if mode == 'add_aromatic':
         is_aromatic = [MAP_INDEX_TO_ATOM_TYPE_AROMATIC[i][1] for i in index.tolist()]
+    elif mode == 'add_aromatic_pdb':
+        is_aromatic = [MAP_INDEX_TO_ATOM_TYPE_AROMATIC_PDB[i][1] for i in index.tolist()]
     elif mode == 'full':
         is_aromatic = [MAP_INDEX_TO_ATOM_TYPE_FULL[i][2] for i in index.tolist()]
     elif mode == 'basic':
@@ -108,9 +148,16 @@ def get_index(atom_num, hybridization, is_aromatic, mode):
         else:
             # print(int(atom_num), bool(is_aromatic)) # Vineeth comment extra atoms lime Br, I are present in pdbbind dataset and not in corossdock
             return MAP_ATOM_TYPE_AROMATIC_TO_INDEX[(1, False)]
-    else:
+    elif mode == 'add_aromatic_pdb':
+        if (int(atom_num), bool(is_aromatic)) in MAP_ATOM_TYPE_AROMATIC_PDB_TO_INDEX:
+            return MAP_ATOM_TYPE_AROMATIC_PDB_TO_INDEX[int(atom_num), bool(is_aromatic)]
+        else:
+            print(int(atom_num), bool(is_aromatic), 'to', 35, False)
+            return MAP_ATOM_TYPE_AROMATIC_PDB_TO_INDEX[(35, False)]
+    elif mode == 'full':
         return MAP_ATOM_TYPE_FULL_TO_INDEX[(int(atom_num), str(hybridization), bool(is_aromatic))]
-
+    else:
+        raise NotImplementedError
 
 class FeaturizeProteinAtom(object):
 
@@ -145,8 +192,12 @@ class FeaturizeLigandAtom(object):
             return len(MAP_ATOM_TYPE_ONLY_TO_INDEX)
         elif self.mode == 'add_aromatic':
             return len(MAP_ATOM_TYPE_AROMATIC_TO_INDEX)
-        else:
+        elif self.mode == 'add_aromatic_pdb':
+            return len(MAP_ATOM_TYPE_AROMATIC_PDB_TO_INDEX)
+        elif self.mode == 'full':
             return len(MAP_ATOM_TYPE_FULL_TO_INDEX)
+        else:
+            raise NotImplementedError
 
     def __call__(self, data: ProteinLigandData):
         element_list = data.ligand_element
@@ -180,4 +231,27 @@ class RandomRotation(object):
         Q = torch.from_numpy(Q.astype(np.float32))
         data.ligand_pos = data.ligand_pos @ Q
         data.protein_pos = data.protein_pos @ Q
+        return data
+
+class AddScaffoldMask(object):
+
+    def __init__(self, mask_path, change_scaffold):
+        super().__init__()
+        self.mask_path = mask_path
+        with open(mask_path, 'rb') as f:
+            self.scaffold_mask = pickle.load(f)
+        self.name2mask = {
+            item[0]: item[1] for item in self.scaffold_mask
+        }
+        self.change_scaffold = change_scaffold
+
+    def __call__(self, data: ProteinLigandData):
+        ligand_filename = data.ligand_filename
+        scaffold_mask = self.name2mask.get(ligand_filename, None)
+        if scaffold_mask is None:
+            print(f'No scaffold mask found for {ligand_filename}, using zeros shaped {data.ligand_element.shape}')
+            scaffold_mask = torch.zeros_like(data.ligand_element, dtype=torch.bool)
+        if self.change_scaffold:
+            scaffold_mask = ~scaffold_mask
+        data.ligand_mask = scaffold_mask
         return data
